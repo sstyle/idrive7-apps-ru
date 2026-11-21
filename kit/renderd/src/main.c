@@ -900,9 +900,11 @@ static void touch_defaults(int area[4]) {
     if (cfg.touch_area[2]) { memcpy(area, cfg.touch_area, 4 * sizeof *area); return; }
     area[0] = area[1] = area[2] = area[3] = 0;
     if (screen_w == 2880 && screen_h == 960) { area[1] = 76; area[2] = 2880; area[3] = 764; }   /* iDrive 8: title strip, climate bar */
-    /* iDrive 7: right of the back column, the title strip included (the kit's page tabs are there; status icons are
-     * never claimed). The units used to pass this as touch_area; built in, the same unit serves iDrive 8 too. */
-    else if (screen_w == 1920 && screen_h == 720) { area[0] = 84; area[1] = 0; area[2] = 1836; area[3] = 720; }
+    /* iDrive 7: the whole screen. A tap nobody claims still goes to the HMI, and the kit's layouts claim right of the
+     * back column only, so its arrow keeps working; an app drawn over the column (a fill layout) may claim it too, so a
+     * tap there no longer goes to the HMI underneath, which would close the app. Status icons are never claimed. The
+     * units used to pass an area as touch_area; built in, the same unit serves iDrive 8 too. */
+    else if (screen_w == 1920 && screen_h == 720) { area[2] = 1920; area[3] = 720; }
 }
 
 /* ---------------- controller gate (upstream inputgate) ---------------- */
@@ -922,7 +924,9 @@ static void ctl_gate_update(uint64_t t) {
     if (ccu_fd < 0) want = 0;
     if (want) {
         if (!ctl_gate_on || t - ctl_gate_t >= GATE_TOUCH_US) {
-            int fd = open(cfg.controller_gate, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
+            /* emptied: an empty file holds the whole controller (gate 1.2.0 reads part words that another renderer
+             * may have left; older gates only look at its age) */
+            int fd = open(cfg.controller_gate, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
             if (fd >= 0) { futimens(fd, NULL); close(fd); }
             if (!ctl_gate_on) log_info("controller: held for an app");
             ctl_gate_on = 1; ctl_gate_t = t;
