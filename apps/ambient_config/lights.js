@@ -32,7 +32,7 @@
  *   l.at(light) -> what the light shows now ({ rgb, bright })     l.rate -> writes a second
  */
 const EventEmitter = require('events');
-const { BDC, BUSES, parseStatus, writeFrame, releaseFrame } = require('./lin');
+const { BDC, BUSES, BDC_G11, parseStatus, writeFrame, releaseFrame } = require('./lin');
 const S = require('./scenes');
 
 const HOLD_S = 60, RENEW_MS = 40000, MOVE_HOLD_S = 5, MOVE_RENEW_MS = 3000;
@@ -134,6 +134,14 @@ class Lights extends EventEmitter {
         return true;
     }
 
+    /** The body module's index (22 F150), once, when it first answers with lights: which names its location codes have. */
+    async _kind() {
+        let r = null;
+        try { r = await this.diag.physical(this.bdc, 0x22, [0xf1, 0x50], 5000, echo(0x22, [0xf1, 0x50])); } catch (e) { r = null; }
+        this.kind = r && r[0] === 0x62 && r.length >= 6 ? r.slice(3, 6).map((x) => (x < 16 ? '0' : '') + x.toString(16).toUpperCase()).join('') : null;
+        this.log.info('lights: body module ' + (this.kind ? this.kind + (this.kind === BDC_G11 ? ' (BDC_G11: its light names)' : '') : 'index not read'));
+    }
+
     /** Reads which lights the car has (the ones known so far stay while it reads, and when nothing answers). */
     async find(opts) {
         const force = !!(opts && opts.force);
@@ -167,7 +175,8 @@ class Lights extends EventEmitter {
                 if (!(reply && reply[0] === 0x7f && reply[2] === 0x21) || tries >= BUSY_TRIES) break;
                 await this.sleep(BUSY_MS * (tries + 1));
             }
-            const got = reply ? parseStatus(bus, reply) : null;
+            if (reply && reply[0] === 0x62 && this.kind === undefined) await this._kind();
+            const got = reply ? parseStatus(bus, reply, this.kind) : null;
             if (got) { found.push.apply(found, got); continue; }
             silent.push(bus);
             if (!reply || (reply[0] === 0x7f && (reply[2] === 0x21 || reply[2] === 0x78))) hung++;
@@ -209,7 +218,10 @@ class Lights extends EventEmitter {
         this.state = found.length ? (this.scene ? 'ours' : 'car') : 'none';
         if (found.length) {
             this.error = null;
-            this.log.info('lights: ' + found.length + ' found (' + found.map((l) => l.name).join(', ') + ')');
+            // (in groups of 8: a log line is cut at 300 characters)
+            for (let i = 0; i < found.length; i += 8) {
+                this.log.info('lights: ' + (i ? '(more) ' : found.length + ' found: ') + found.slice(i, i + 8).map((l) => l.name + (l.part === 'lower' ? ' (lower)' : '')).join(', '));
+            }
             this.emit('found', found.map((l) => Object.assign({}, l)));
         } else this.log.warn('lights: none found' + (this.error ? ': ' + this.error : ''));
         this.emit('change');
@@ -224,7 +236,8 @@ class Lights extends EventEmitter {
         if (this._flash && now < this._flash.until) return { rgb: this._flash.rgb, bright: 100 };
         // the overlay set last wins
         const ov = this._overs ? Array.from(this._overs.values()).reverse().find((o) => o.test(light)) : null;
-        if (ov) { const v = ov.at(now - ov.t0, !!this._phase); return { rgb: v.rgb, bright: Math.round(v.bright * this._dim) }; }
+        // (an overlay, a turn signal's glow or an open door, still shows while the lights are off by day)
+        if (ov) { const v = ov.at(now - ov.t0, !!this._phase); return { rgb: v.rgb, bright: Math.round(v.bright * (this._dim || 1)) }; }
         const sc = scene || this.scene;
         if (!sc) return null;
         const v = S.lightAt(sc, light, t == null ? now - this.t0 : t);
@@ -363,7 +376,7 @@ class Lights extends EventEmitter {
      * a write for each light that wants another. [{ lights (written), need (the lights it is for), want, nad }]
      */
     _plan(t) {
-        const items = [];
+        const items = [], moving = S.moves(this.scene) || !!(this._flash && this.now() < this._flash.until + 50) || !!(this._overs && this._overs.size);
         for (let bus = 0; bus < BUSES.length; bus++) {
             // (no scene: only the lights an overlay or a flash colours; the others keep the car's own colour)
             const all = this.lights.filter((l) => l.bus === bus).sort((a, b) => a.y - b.y);
@@ -373,7 +386,12 @@ class Lights extends EventEmitter {
             wants.forEach((w) => { count[key(w)] = (count[key(w)] || 0) + 1; });
             const top = Object.keys(count).sort((a, b) => count[b] - count[a])[0];
             // (NAD 0 reaches every light of the bus: only when all of them take a colour of ours)
-            const most = on.length === all.length && count[top] > 1 ? wants.find((w) => key(w) === top) : null;
+            let most = on.length === all.length && count[top] > 1 ? wants.find((w) => key(w) === top) : null;
+            // a still colour with lights of the bus in another one (upper and lower): NAD 0 only when the colour changes.
+            // Its renewal (every 40 s) and the once-more after it went to every light, and the others showed the most
+            // wanted colour until their own writes came (#264: the upper lights flashed the lower colour), so then only
+            // the lights due are written, each its own colour.
+            if (most && !moving && count[top] < on.length && on.every((l, i) => key(wants[i]) !== top || same(wants[i], this._last.get(l)))) most = null;
             if (most) items.push({ lights: on, need: on.filter((l, i) => key(wants[i]) === top), want: most, nad: ALL });
             on.forEach((l, i) => { if (!most || key(wants[i]) !== top) items.push({ lights: [l], need: [l], want: wants[i], nad: l.nad }); });
         }
@@ -383,7 +401,8 @@ class Lights extends EventEmitter {
     /** A still colour's writes once more (a light that missed one takes it now), or the give-back once more. */
     _again() {
         if (this._checkOff) { this._gave.forEach((bus) => this._release.push({ bus, again: true })); this._gave = []; }
-        else this._sentNow.forEach((l) => this._last.delete(l));
+        // (written again as a renewal is, colour unchanged: no NAD 0 over lights of another colour, #264)
+        else this._sentNow.forEach((l) => { const had = this._last.get(l); if (had) this._last.set(l, Object.assign({}, had, { at: -Infinity })); });
         this._sentNow.clear();
         this._frame = null;
     }
